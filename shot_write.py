@@ -68,8 +68,8 @@ def _settings_file():
 
 
 def _validate_naming_options(options):
-    if not isinstance(options, (list, tuple)) or len(options) != len(_NAMING_OPTIONS):
-        raise ValueError("Enter five naming suffixes.")
+    if not isinstance(options, (list, tuple)) or not options:
+        raise ValueError("Keep at least one naming suffix.")
     names = []
     for option in options:
         if not isinstance(option, str):
@@ -108,14 +108,48 @@ def edit_naming_suffixes():
     dialog.setWindowTitle("Shot Write — Naming Suffixes")
     dialog.setMinimumWidth(390)
     layout = widgets.QVBoxLayout(dialog)
-    form = widgets.QFormLayout()
-    fields = []
-    for index, name in enumerate(_load_naming_options(), 1):
+    scroll = widgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setMinimumHeight(220)
+    content = widgets.QWidget()
+    rows = widgets.QVBoxLayout(content)
+    rows.addStretch()
+    scroll.setWidget(content)
+    layout.addWidget(scroll)
+    entries = []
+
+    def remove_entry(entry):
+        entries.remove(entry)
+        row, _, _ = entry
+        rows.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        for _, _, button in entries:
+            button.setEnabled(len(entries) > 1)
+
+    def add_entry(name=""):
+        row = widgets.QWidget()
+        row_layout = widgets.QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
         field = widgets.QLineEdit(name)
-        field.setAccessibleName(f"Naming suffix {index}")
-        form.addRow(f"Suffix {index}", field)
-        fields.append(field)
-    layout.addLayout(form)
+        field.setAccessibleName("Naming suffix")
+        remove = widgets.QPushButton("Remove")
+        entry = (row, field, remove)
+        remove.clicked.connect(lambda: remove_entry(entry))
+        row_layout.addWidget(field)
+        row_layout.addWidget(remove)
+        entries.append(entry)
+        rows.insertWidget(rows.count() - 1, row)
+        for _, _, button in entries:
+            button.setEnabled(len(entries) > 1)
+        field.setFocus()
+        scroll.ensureWidgetVisible(row)
+
+    for name in _load_naming_options():
+        add_entry(name)
+    add = widgets.QPushButton("Add Suffix")
+    add.clicked.connect(lambda: add_entry())
+    layout.addWidget(add)
     hint = widgets.QLabel("End a suffix with _00x for automatic numbering, e.g. preRender_00x.")
     hint.setWordWrap(True)
     layout.addWidget(hint)
@@ -125,15 +159,17 @@ def edit_naming_suffixes():
 
     def save():
         try:
-            _save_naming_options([field.text() for field in fields])
+            _save_naming_options([field.text() for _, field, _ in entries])
         except (OSError, ValueError) as error:
             widgets.QMessageBox.warning(dialog, "Shot Write", str(error))
             return
         dialog.accept()
 
     def defaults():
-        for field, name in zip(fields, _NAMING_OPTIONS):
-            field.setText(name)
+        for entry in list(entries):
+            remove_entry(entry)
+        for name in _NAMING_OPTIONS:
+            add_entry(name)
 
     buttons.accepted.connect(save)
     buttons.rejected.connect(dialog.reject)
@@ -675,6 +711,7 @@ def _ring_widget(core, gui, widgets):
         SIZE = 328
         INNER = 66
         OUTER = 159
+        NAMES_PER_PAGE = 5
 
         def __init__(self, parent, frame, file_type=None):
             super().__init__(parent, qt.Popup | qt.FramelessWindowHint)
@@ -689,14 +726,38 @@ def _ring_widget(core, gui, widgets):
             self.render_frame = None
             center = self.SIZE / 2
             self.center = core.QPointF(center, center)
+            self.previous_page = widgets.QPushButton("‹", self)
+            self.previous_page.setAccessibleName("Previous suffix page")
+            self.previous_page.setGeometry(int(center) - 49, int(center) + 28, 25, 23)
+            self.previous_page.clicked.connect(lambda: self.change_page(-1))
+            self.next_page = widgets.QPushButton("›", self)
+            self.next_page.setAccessibleName("Next suffix page")
+            self.next_page.setGeometry(int(center) + 24, int(center) + 28, 25, 23)
+            self.next_page.clicked.connect(lambda: self.change_page(1))
             self.set_level("formats" if file_type is None else self.format_level())
 
         def format_level(self):
             return "names" if self.file_type == "mov" else "frames"
 
         def set_level(self, level):
+            self.page = 0
             self.level = level
+            self.update_sectors()
+
+        def change_page(self, step):
+            if self.level == "names":
+                self.page = max(0, min(self.page + step, self.page_count - 1))
+                self.update_sectors()
+
+        def update_sectors(self):
+            level = self.level
             self.hovered = None
+            self.page_count = math.ceil(len(self.naming_options) / self.NAMES_PER_PAGE)
+            paged = level == "names" and self.page_count > 1
+            self.previous_page.setVisible(paged)
+            self.next_page.setVisible(paged)
+            self.previous_page.setEnabled(self.page > 0)
+            self.next_page.setEnabled(self.page + 1 < self.page_count)
             if level == "formats":
                 self.labels = (("PNG", "Reference"), ("EXR", "Precomp"), ("DPX", "Precomp"), ("MOV", "H.264"))
                 angles, half_angle = (90, 0, -90, 180), 43
@@ -704,8 +765,11 @@ def _ring_widget(core, gui, widgets):
                 self.labels = (("1 Frame", f"Frame {self.frame}"), ("Sequence", "Frame range"))
                 angles, half_angle = (180, 0), 88
             else:
-                self.labels = tuple((name, "Next number" if _numbered_prefix(name) is not None else "") for name in self.naming_options)
-                angles, half_angle = (90, 18, -54, -126, 162), 34
+                start = self.page * self.NAMES_PER_PAGE
+                names = self.naming_options[start:start + self.NAMES_PER_PAGE]
+                self.labels = tuple((name, "Next number" if _numbered_prefix(name) is not None else "") for name in names)
+                angles = tuple(90 - index * 360 / len(names) for index in range(len(names)))
+                half_angle = 180 / len(names) - 2
 
             self.offsets = [(112 * math.cos(math.radians(a)), -112 * math.sin(math.radians(a))) for a in angles]
             self.sectors = []
@@ -751,6 +815,9 @@ def _ring_widget(core, gui, widgets):
         def keyPressEvent(self, event):
             if event.isAutoRepeat():
                 return
+            if self.level == "names" and event.key() in (qt.Key_PageUp, qt.Key_PageDown):
+                self.change_page(1 if event.key() == qt.Key_PageDown else -1)
+                return
             if self.level == "formats":
                 keys = (qt.Key_Up, qt.Key_Right, qt.Key_Down, qt.Key_Left)
             elif self.level == "frames":
@@ -773,6 +840,13 @@ def _ring_widget(core, gui, widgets):
             self.selected = None
             super().reject()
 
+        def wheelEvent(self, event):
+            if self.level == "names" and event.angleDelta().y():
+                self.change_page(1 if event.angleDelta().y() < 0 else -1)
+                event.accept()
+            else:
+                super().wheelEvent(event)
+
         def choose(self, index):
             if index is None:
                 self.reject()
@@ -784,7 +858,8 @@ def _ring_widget(core, gui, widgets):
                 self.render_frame = self.frame if index == 0 else None
                 self.set_level("names")
             else:
-                self.selected = (self.file_type, self.render_frame, self.naming_options[index])
+                name_index = self.page * self.NAMES_PER_PAGE + index
+                self.selected = (self.file_type, self.render_frame, self.naming_options[name_index])
                 self.accept()
 
         def paintEvent(self, event):
@@ -814,6 +889,8 @@ def _ring_widget(core, gui, widgets):
                     mode = "Sequence" if self.render_frame is None else f"Frame {self.render_frame}"
                     detail = f"{self.file_type.upper()} · {mode}"
                 self.draw_centered(painter, 0, 11, detail, 11, "#b6c4d1")
+                if self.page_count > 1:
+                    self.draw_centered(painter, 0, 39, f"{self.page + 1}/{self.page_count}", 11, "#b6c4d1")
 
         def draw_centered(self, painter, x, y, text, size, color, bold=False):
             font = painter.font()
