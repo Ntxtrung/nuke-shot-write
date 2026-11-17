@@ -23,6 +23,10 @@ Lưu script `.nk`, chọn node ảnh nguồn và bấm **Shift+Alt+W** trong Nod
 - `preRender_00x` tự lấy số tiếp theo từ các Write và thư mục output của shot.
 - Với 1 Frame, dùng nút **Render Frame** trong tab **Shot Write** của node để render frame đã chọn.
 
+Chọn **Shot Write → Edit Naming Suffixes** trong menu Nodes để sửa năm hậu tố. Bấm **Save** để áp dụng cho lần mở vòng tiếp theo. **Restore Defaults** điền lại năm tên mặc định để bạn lưu. Cấu hình cá nhân nằm tại `.nuke/shot_write_settings.json`.
+
+Có thể dùng hậu tố kết thúc bằng `_00x` để tự tăng số. Ví dụ, `review_00x` tạo `review_001`, `review_002`… Các hậu tố hỗ trợ chữ, số, dấu gạch dưới và dấu gạch nối.
+
 Khi `.nk` nằm trong thư mục `nuke`, output nằm trong thư mục `preRender` cùng cấp. Tên shot lấy từ thư mục cha của `nuke`. Với script nằm ở thư mục khác, thư mục chứa script được dùng làm thư mục shot.
 
 Ví dụ sequence EXR và ảnh PNG frame 1001 lần xuất đầu tiên có đường dẫn như sau.

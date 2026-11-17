@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 *.bak
 _Backups/
+shot_write_settings.json

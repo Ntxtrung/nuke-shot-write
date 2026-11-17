@@ -63,6 +63,93 @@ def _qt_modules():
     return QtCore, QtGui, QtWidgets
 
 
+def _settings_file():
+    return Path(os.environ.get("HOME") or Path.home()) / ".nuke" / "shot_write_settings.json"
+
+
+def _validate_naming_options(options):
+    if not isinstance(options, (list, tuple)) or len(options) != len(_NAMING_OPTIONS):
+        raise ValueError("Enter five naming suffixes.")
+    names = []
+    for option in options:
+        if not isinstance(option, str):
+            raise ValueError("Each suffix must be text.")
+        name = option.strip()
+        if not name or not all(char.isalnum() or char in "_-" for char in name):
+            raise ValueError("Use letters, numbers, underscores or hyphens in each suffix.")
+        names.append(name)
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("Each suffix must have a different name.")
+    return tuple(names)
+
+
+def _load_naming_options():
+    try:
+        settings = json.loads(_settings_file().read_text(encoding="utf-8"))
+        return _validate_naming_options(settings["naming_options"])
+    except FileNotFoundError:
+        return _NAMING_OPTIONS
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        nuke.tprint(f"Shot Write settings: {error}. Using default naming suffixes.")
+        return _NAMING_OPTIONS
+
+
+def _save_naming_options(options):
+    names = _validate_naming_options(options)
+    path = _settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"naming_options": names}, ensure_ascii=False, indent=2) + "\n"
+    _atomic_write(path, payload.encode("utf-8"))
+
+
+def edit_naming_suffixes():
+    _, _, widgets = _qt_modules()
+    dialog = widgets.QDialog(widgets.QApplication.activeWindow())
+    dialog.setWindowTitle("Shot Write — Naming Suffixes")
+    dialog.setMinimumWidth(390)
+    layout = widgets.QVBoxLayout(dialog)
+    form = widgets.QFormLayout()
+    fields = []
+    for index, name in enumerate(_load_naming_options(), 1):
+        field = widgets.QLineEdit(name)
+        field.setAccessibleName(f"Naming suffix {index}")
+        form.addRow(f"Suffix {index}", field)
+        fields.append(field)
+    layout.addLayout(form)
+    hint = widgets.QLabel("End a suffix with _00x for automatic numbering, e.g. preRender_00x.")
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
+    buttons = widgets.QDialogButtonBox(
+        widgets.QDialogButtonBox.Save | widgets.QDialogButtonBox.Cancel | widgets.QDialogButtonBox.RestoreDefaults
+    )
+
+    def save():
+        try:
+            _save_naming_options([field.text() for field in fields])
+        except (OSError, ValueError) as error:
+            widgets.QMessageBox.warning(dialog, "Shot Write", str(error))
+            return
+        dialog.accept()
+
+    def defaults():
+        for field, name in zip(fields, _NAMING_OPTIONS):
+            field.setText(name)
+
+    buttons.accepted.connect(save)
+    buttons.rejected.connect(dialog.reject)
+    buttons.button(widgets.QDialogButtonBox.RestoreDefaults).clicked.connect(defaults)
+    layout.addWidget(buttons)
+    if hasattr(dialog, "exec"):
+        dialog.exec()
+    else:
+        dialog.exec_()
+    dialog.deleteLater()
+
+
+def _numbered_prefix(naming):
+    return naming[:-3] if naming.endswith("_00x") else None
+
+
 def _output_colorspace(root, node):
     file_type = node["file_type"].value()
     if file_type == "exr":
@@ -417,8 +504,9 @@ def paste_render_as_read():
 
 
 def _file_pattern(file_type, slot, multiview, frame=None, naming="toRunAI", still_slot=1):
-    if naming == "preRender_00x":
-        naming = f"preRender_{slot:03d}"
+    numbered = _numbered_prefix(naming)
+    if numbered is not None:
+        naming = f"{numbered}{slot:03d}"
         slot = 1
     suffix = f"_{slot:02d}" if slot > 1 else ""
     stem = f"{_SHOT_NAME}_{naming}{suffix}"
@@ -431,15 +519,16 @@ def _file_pattern(file_type, slot, multiview, frame=None, naming="toRunAI", stil
 
 def _next_slot(file_type, naming, frame, shot_dir, used_paths):
     slot = 1
-    if naming == "preRender_00x":
+    numbered = _numbered_prefix(naming)
+    if numbered is not None:
         # Count across formats and frame modes so an output number identifies one export.
-        pattern = re.compile(r"_preRender_(\d+)(?=[_ .\]}]|$)", re.IGNORECASE)
+        pattern = re.compile("_" + re.escape(numbered) + r"(\d+)(?=[_ .\]}]|$)", re.IGNORECASE)
         numbers = [int(m.group(1)) for path in used_paths if path.startswith(_RENDER_JOIN) for m in pattern.finditer(path)]
         for ext in _PROFILES:
             try:
                 folders = (shot_dir / "preRender" / ext).iterdir()
                 for folder in folders:
-                    if folder.name.casefold().startswith(f"{shot_dir.name}_prerender_".casefold()):
+                    if folder.name.casefold().startswith(f"{shot_dir.name}_{numbered}".casefold()):
                         numbers.extend(int(m.group(1)) for m in pattern.finditer(folder.name))
             except FileNotFoundError:
                 pass
@@ -451,8 +540,9 @@ def _next_slot(file_type, naming, frame, shot_dir, used_paths):
 
 
 def _next_still_slot(file_type, naming, slot, frame, shot_dir, used_paths):
-    if naming == "preRender_00x":
-        naming = f"preRender_{slot:03d}"
+    numbered = _numbered_prefix(naming)
+    if numbered is not None:
+        naming = f"{numbered}{slot:03d}"
     prefix = f"{_RENDER_JOIN}{file_type} "
     counter = re.compile(rf"_{re.escape(naming)}_{frame:04d}_(\d+)" r"(?=[ .\]]|$)", re.IGNORECASE)
     numbers = [int(m[1]) for path in used_paths if path.startswith(prefix) for m in counter.finditer(path)]
@@ -593,6 +683,7 @@ def _ring_widget(core, gui, widgets):
             self.setMouseTracking(True)
             self.setAccessibleName("Shot Write Action Ring")
             self.selected = None
+            self.naming_options = _load_naming_options()
             self.frame = frame
             self.file_type = file_type
             self.render_frame = None
@@ -613,7 +704,7 @@ def _ring_widget(core, gui, widgets):
                 self.labels = (("1 Frame", f"Frame {self.frame}"), ("Sequence", "Frame range"))
                 angles, half_angle = (180, 0), 88
             else:
-                self.labels = tuple((name, "Next number" if name == "preRender_00x" else "") for name in _NAMING_OPTIONS)
+                self.labels = tuple((name, "Next number" if _numbered_prefix(name) is not None else "") for name in self.naming_options)
                 angles, half_angle = (90, 18, -54, -126, 162), 34
 
             self.offsets = [(112 * math.cos(math.radians(a)), -112 * math.sin(math.radians(a))) for a in angles]
@@ -693,7 +784,7 @@ def _ring_widget(core, gui, widgets):
                 self.render_frame = self.frame if index == 0 else None
                 self.set_level("names")
             else:
-                self.selected = (self.file_type, self.render_frame, _NAMING_OPTIONS[index])
+                self.selected = (self.file_type, self.render_frame, self.naming_options[index])
                 self.accept()
 
         def paintEvent(self, event):
@@ -707,9 +798,9 @@ def _ring_widget(core, gui, widgets):
                 painter.setPen(gui.QColor("#465261"))
                 painter.setBrush(gui.QColor("#344b61" if i == self.hovered else "#252c35"))
                 painter.drawPath(path)
-                if title == "preRender_00x":
+                if _numbered_prefix(title) is not None:
                     dx -= 9
-                size = 13 if title == "preRender_00x" else 14
+                size = 13 if _numbered_prefix(title) is not None else 14
                 self.draw_centered(painter, dx, dy - 8 if subtitle else dy, title, size, "#f4f6f8", True)
                 if subtitle:
                     self.draw_centered(painter, dx, dy + 11, subtitle, 11, "#b6c4d1")
@@ -731,6 +822,7 @@ def _ring_widget(core, gui, widgets):
             painter.setFont(font)
             painter.setPen(gui.QColor(color))
             box = core.QRectF(self.center.x() + x - 52, self.center.y() + y - 10, 104, 20)
+            text = painter.fontMetrics().elidedText(text, qt.ElideRight, int(box.width()))
             painter.drawText(box, qt.AlignCenter, text)
 
     return ShotWriteRing
@@ -748,6 +840,7 @@ def register_menu(replace=False):
     for label, file_type, shortcut in _COMMANDS:
         menu.addCommand(label, partial(_open_ring, file_type), shortcut, icon="Write.png", shortcutContext=2)
     menu.addSeparator()
+    menu.addCommand("Edit Naming Suffixes", edit_naming_suffixes, icon="Write.png", shortcutContext=2)
     menu.addCommand("Paste Render as Read", paste_render_as_read, "Ctrl+Alt+R", icon="Read.png", shortcutContext=2)
     menu.addCommand("Update Selected Writes", _update_selected_writes, icon="Write.png", shortcutContext=2)
 
