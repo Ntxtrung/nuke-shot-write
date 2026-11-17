@@ -13,6 +13,12 @@ runpy.run_path(r"C:\path\to\nuke-shot-write\shot_write.py")["install"]()
 
 Script cài `shot_write.py` và thêm lệnh nạp vào `menu.py` trong thư mục `.nuke` của người dùng. `menu.py` hiện có được sao lưu trước khi thêm lệnh.
 
+```python
+# Shot Write startup
+import shot_write
+shot_write.register_menu()
+```
+
 ## Sử dụng
 
 Lưu script `.nk`, chọn node ảnh nguồn và bấm **Shift+Alt+W** trong Node Graph.
