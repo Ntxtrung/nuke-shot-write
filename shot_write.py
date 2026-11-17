@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import tempfile
+import uuid
 from functools import partial
 from pathlib import Path
 
@@ -67,6 +68,33 @@ def _settings_file():
     return Path(os.environ.get("HOME") or Path.home()) / ".nuke" / "shot_write_settings.json"
 
 
+def _format_preset(file_type, label=None):
+    _, channels, datatype = _PROFILES[file_type]
+    return {
+        "id": uuid.uuid4().hex, "label": label or file_type.upper(), "enabled": True,
+        "file_type": file_type, "channels": channels, "datatype": datatype or "",
+        "compression": "Zip (1 scanline)" if file_type == "exr" else "",
+        "codec": "h264" if file_type == "mov" else "", "output_transform": "",
+        "match_plate": file_type in {"exr", "dpx"},
+        "choose_frames": file_type != "mov", "default_mode": "sequence",
+    }
+
+
+def _default_settings():
+    return {
+        "version": 2,
+        "formats": [_format_preset(ext) for ext in _PROFILES],
+        "modes": [
+            {"id": "frame", "label": "1 Frame", "enabled": True, "kind": "frame"},
+            {"id": "sequence", "label": "Sequence", "enabled": True, "kind": "sequence"},
+        ],
+        "names": [
+            {"id": uuid.uuid4().hex, "label": name, "suffix": name, "enabled": True}
+            for name in _NAMING_OPTIONS
+        ],
+    }
+
+
 def _validate_naming_options(options):
     if not isinstance(options, (list, tuple)) or not options:
         raise ValueError("Keep at least one naming suffix.")
@@ -83,103 +111,408 @@ def _validate_naming_options(options):
     return tuple(names)
 
 
-def _load_naming_options():
+def _validate_settings(settings):
+    if not isinstance(settings, dict):
+        raise ValueError("Invalid Action Ring settings.")
+    defaults = _default_settings()
+    if "formats" not in settings and "naming_options" in settings:
+        names = _validate_naming_options(settings["naming_options"])
+        defaults["names"] = [
+            {"id": uuid.uuid4().hex, "label": name, "suffix": name, "enabled": True}
+            for name in names
+        ]
+        return defaults
+
+    clean = {"version": 2}
+    datatypes = {
+        "png": {"8 bit", "16 bit"}, "exr": {"16 bit half", "32 bit float"},
+        "dpx": {"8 bit", "10 bit", "12 bit", "16 bit"}, "mov": {""},
+    }
+    for level in ("formats", "modes", "names"):
+        entries = settings.get(level, defaults[level])
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"Keep at least one item in {level}.")
+        labels, ids, result = set(), set(), []
+        for raw in entries:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Invalid item in {level}.")
+            label = raw.get("label", "")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(f"Every item in {level} needs a display name.")
+            label = label.strip()
+            if label.casefold() in labels:
+                raise ValueError(f"Display names in {level} must be different.")
+            labels.add(label.casefold())
+            entry_id = raw.get("id") or uuid.uuid4().hex
+            if not isinstance(entry_id, str) or entry_id in ids:
+                raise ValueError(f"Duplicate or invalid item ID in {level}.")
+            ids.add(entry_id)
+            enabled = raw.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValueError("Enabled must be true or false.")
+            entry = {"id": entry_id, "label": label, "enabled": enabled}
+            if level == "names":
+                entry["suffix"] = _validate_naming_options([raw.get("suffix", "")])[0]
+            elif level == "modes":
+                if raw.get("kind") not in {"frame", "sequence"}:
+                    raise ValueError("Render mode must be frame or sequence.")
+                entry["kind"] = raw["kind"]
+            else:
+                ext = raw.get("file_type")
+                if ext not in _PROFILES:
+                    raise ValueError("Choose PNG, EXR, DPX or MOV as the file type.")
+                preset = _format_preset(ext)
+                preset.update(raw)
+                for key in ("datatype", "compression", "codec", "output_transform", "channels"):
+                    if not isinstance(preset[key], str):
+                        raise ValueError(f"Invalid {key} in {label}.")
+                    preset[key] = preset[key].strip()
+                if preset["datatype"] not in datatypes[ext]:
+                    raise ValueError(f"Choose a valid datatype for {label}.")
+                if preset["channels"] not in {"rgb", "rgba", "all"}:
+                    raise ValueError(f"Choose RGB, RGBA or all channels for {label}.")
+                if ext == "exr" and not preset["compression"]:
+                    raise ValueError(f"Choose EXR compression for {label}.")
+                if ext == "mov" and not preset["codec"]:
+                    raise ValueError(f"Choose a MOV codec for {label}.")
+                for key in ("match_plate", "choose_frames"):
+                    if not isinstance(preset[key], bool):
+                        raise ValueError(f"Invalid {key} in {label}.")
+                if preset["default_mode"] not in {"frame", "sequence"}:
+                    raise ValueError(f"Choose a default render mode for {label}.")
+                entry = {key: preset[key] for key in _format_preset(ext)}
+                entry.update(id=entry_id, label=label, enabled=enabled)
+            result.append(entry)
+        if not any(item["enabled"] for item in result):
+            raise ValueError(f"Enable at least one item in {level}.")
+        clean[level] = result
+    _validate_naming_options([item["suffix"] for item in clean["names"]])
+    return clean
+
+
+def _load_settings():
     try:
-        settings = json.loads(_settings_file().read_text(encoding="utf-8"))
-        return _validate_naming_options(settings["naming_options"])
+        return _validate_settings(json.loads(_settings_file().read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return _NAMING_OPTIONS
+        return _default_settings()
     except (OSError, ValueError, TypeError, KeyError) as error:
-        nuke.tprint(f"Shot Write settings: {error}. Using default naming suffixes.")
-        return _NAMING_OPTIONS
+        nuke.tprint(f"Shot Write settings: {error}. Using default Action Ring settings.")
+        return _default_settings()
+
+
+def _save_settings(settings):
+    clean = _validate_settings(settings)
+    path = _settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, (json.dumps(clean, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def _load_naming_options():
+    return tuple(item["suffix"] for item in _load_settings()["names"] if item["enabled"])
 
 
 def _save_naming_options(options):
     names = _validate_naming_options(options)
-    path = _settings_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"naming_options": names}, ensure_ascii=False, indent=2) + "\n"
-    _atomic_write(path, payload.encode("utf-8"))
+    settings = _load_settings()
+    settings["names"] = [
+        {"id": uuid.uuid4().hex, "label": name, "suffix": name, "enabled": True} for name in names
+    ]
+    _save_settings(settings)
+
+
+def _editor_widget(core, gui, widgets):
+    qt = core.Qt
+
+    class ActionRingEditor(widgets.QDialog):
+        LEVELS = ("formats", "modes", "names")
+
+        def __init__(self, parent=None, initial_level="formats"):
+            super().__init__(parent)
+            self.setWindowTitle("Shot Write — Edit Action Ring")
+            self.resize(830, 530)
+            self.loading = False
+            self.entries = {}
+            self.lists = {}
+            layout = widgets.QVBoxLayout(self)
+            body = widgets.QSplitter()
+            layout.addWidget(body)
+            self.levels = widgets.QListWidget()
+            self.levels.addItems(("Formats", "Render modes", "Naming suffixes"))
+            self.levels.setMaximumWidth(160)
+            body.addWidget(self.levels)
+            right = widgets.QWidget()
+            right_layout = widgets.QVBoxLayout(right)
+            body.addWidget(right)
+            split = widgets.QSplitter()
+            right_layout.addWidget(split)
+            self.pages = widgets.QStackedWidget()
+            for level in self.LEVELS:
+                listing = widgets.QListWidget()
+                listing.setDragDropMode(widgets.QAbstractItemView.InternalMove)
+                listing.setDefaultDropAction(qt.MoveAction)
+                listing.setAccessibleName(level)
+                listing.currentItemChanged.connect(lambda current, previous: self.select_item())
+                self.lists[level] = listing
+                self.pages.addWidget(listing)
+            split.addWidget(self.pages)
+            properties = widgets.QWidget()
+            form = widgets.QFormLayout(properties)
+            self.label = widgets.QLineEdit()
+            self.label.setAccessibleName("Display name")
+            form.addRow("Display name", self.label)
+            self.properties = widgets.QStackedWidget()
+            form.addRow(self.properties)
+            split.addWidget(properties)
+            split.setStretchFactor(1, 1)
+
+            format_page = widgets.QWidget()
+            format_form = widgets.QFormLayout(format_page)
+            self.file_type = widgets.QComboBox()
+            self.file_type.addItems(tuple(_PROFILES))
+            self.channels = widgets.QComboBox()
+            self.channels.addItems(("rgb", "rgba", "all"))
+            self.datatype = widgets.QComboBox()
+            self.compression = widgets.QComboBox()
+            self.compression.setEditable(True)
+            self.compression.addItems(tuple(_EXR_COMPRESSION.values()))
+            self.codec = widgets.QComboBox()
+            self.codec.setEditable(True)
+            self.codec.addItems(("h264", "appr"))
+            self.output = widgets.QLineEdit()
+            self.output.setPlaceholderText("Auto")
+            self.match_plate = widgets.QCheckBox("Match Read_Plate")
+            self.match_plate.setToolTip("Match datatype, EXR compression and output transform from Read_Plate.")
+            self.choose_frames = widgets.QCheckBox("Ask for render mode")
+            self.default_mode = widgets.QComboBox()
+            self.default_mode.addItems(("sequence", "frame"))
+            for label, control in (
+                ("File type", self.file_type), ("Channels", self.channels), ("Datatype", self.datatype),
+                ("Compression", self.compression), ("MOV codec", self.codec), ("Output transform", self.output),
+                ("", self.match_plate), ("", self.choose_frames), ("Default mode", self.default_mode),
+            ):
+                format_form.addRow(label, control)
+            self.properties.addWidget(format_page)
+
+            mode_page = widgets.QWidget()
+            mode_form = widgets.QFormLayout(mode_page)
+            self.kind = widgets.QComboBox()
+            self.kind.addItems(("frame", "sequence"))
+            mode_form.addRow("Render behavior", self.kind)
+            self.properties.addWidget(mode_page)
+
+            name_page = widgets.QWidget()
+            name_form = widgets.QFormLayout(name_page)
+            self.suffix = widgets.QLineEdit()
+            self.suffix.setAccessibleName("Filename suffix")
+            name_form.addRow("Filename suffix", self.suffix)
+            hint = widgets.QLabel("End with _00x to increment the output number.")
+            hint.setWordWrap(True)
+            name_form.addRow(hint)
+            self.properties.addWidget(name_page)
+
+            actions = widgets.QHBoxLayout()
+            self.add = widgets.QPushButton("Add")
+            self.remove = widgets.QPushButton("Remove")
+            actions.addWidget(self.add)
+            actions.addWidget(self.remove)
+            actions.addStretch()
+            right_layout.addLayout(actions)
+            hint = widgets.QLabel("Check items to show them in the ring. Drag items to change their order.")
+            hint.setWordWrap(True)
+            right_layout.addWidget(hint)
+            buttons = widgets.QDialogButtonBox(
+                widgets.QDialogButtonBox.Save | widgets.QDialogButtonBox.Cancel | widgets.QDialogButtonBox.RestoreDefaults
+            )
+            layout.addWidget(buttons)
+            self.levels.currentRowChanged.connect(self.change_level)
+            self.label.textEdited.connect(self.change_values)
+            self.suffix.textEdited.connect(self.change_values)
+            self.output.textEdited.connect(self.change_values)
+            for combo in (self.channels, self.datatype, self.compression, self.codec, self.default_mode, self.kind):
+                combo.currentTextChanged.connect(self.change_values)
+            self.match_plate.toggled.connect(self.change_values)
+            self.choose_frames.toggled.connect(self.change_values)
+            self.file_type.currentTextChanged.connect(self.change_file_type)
+            self.add.clicked.connect(self.add_item)
+            self.remove.clicked.connect(self.remove_item)
+            buttons.accepted.connect(self.save)
+            buttons.rejected.connect(self.reject)
+            buttons.button(widgets.QDialogButtonBox.RestoreDefaults).clicked.connect(lambda: self.populate(_default_settings()))
+            self.populate(_load_settings())
+            self.levels.setCurrentRow(self.LEVELS.index(initial_level))
+
+        def current_level(self):
+            return self.LEVELS[max(0, self.levels.currentRow())]
+
+        def populate(self, settings):
+            self.loading = True
+            self.entries.clear()
+            for level in self.LEVELS:
+                listing = self.lists[level]
+                listing.clear()
+                for entry in settings[level]:
+                    self.append_item(level, dict(entry))
+                listing.setCurrentRow(0)
+            self.loading = False
+            self.select_item()
+
+        def append_item(self, level, entry):
+            # The item stores a key so edits and drag order refer to the same Python data.
+            key = uuid.uuid4().hex
+            self.entries[key] = entry
+            item = widgets.QListWidgetItem(entry["label"])
+            item.setData(qt.UserRole, key)
+            item.setFlags(item.flags() | qt.ItemIsUserCheckable | qt.ItemIsDragEnabled | qt.ItemIsDropEnabled)
+            item.setCheckState(qt.Checked if entry["enabled"] else qt.Unchecked)
+            self.lists[level].addItem(item)
+            return item
+
+        def change_level(self, index):
+            self.pages.setCurrentIndex(index)
+            self.properties.setCurrentIndex(index)
+            self.select_item()
+
+        def select_item(self):
+            if self.loading:
+                return
+            level = self.current_level()
+            listing = self.lists[level]
+            item = listing.currentItem()
+            self.remove.setEnabled(listing.count() > 1)
+            if item is None:
+                return
+            entry = self.entries[item.data(qt.UserRole)]
+            self.loading = True
+            self.label.setText(entry["label"])
+            if level == "formats":
+                self.file_type.setCurrentText(entry["file_type"])
+                self.channels.setCurrentText(entry["channels"])
+                self.datatype.clear()
+                choices = {
+                    "png": ("8 bit", "16 bit"), "exr": ("16 bit half", "32 bit float"),
+                    "dpx": ("8 bit", "10 bit", "12 bit", "16 bit"), "mov": ("",),
+                }
+                self.datatype.addItems(choices[entry["file_type"]])
+                self.datatype.setCurrentText(entry["datatype"])
+                self.compression.setCurrentText(entry["compression"])
+                self.codec.setCurrentText(entry["codec"])
+                self.output.setText(entry["output_transform"])
+                self.match_plate.setChecked(entry["match_plate"])
+                self.choose_frames.setChecked(entry["choose_frames"])
+                self.default_mode.setCurrentText(entry["default_mode"])
+                self.update_controls()
+            elif level == "modes":
+                self.kind.setCurrentText(entry["kind"])
+            else:
+                self.suffix.setText(entry["suffix"])
+            self.loading = False
+
+        def update_controls(self):
+            ext = self.file_type.currentText()
+            self.datatype.setEnabled(ext != "mov")
+            self.compression.setEnabled(ext == "exr")
+            self.codec.setEnabled(ext == "mov")
+            self.match_plate.setEnabled(ext in {"exr", "dpx"})
+            self.default_mode.setEnabled(not self.choose_frames.isChecked())
+
+        def change_file_type(self, ext):
+            if self.loading:
+                return
+            item = self.lists["formats"].currentItem()
+            if item is None:
+                return
+            entry = self.entries[item.data(qt.UserRole)]
+            defaults = _format_preset(ext)
+            for key in ("file_type", "channels", "datatype", "compression", "codec", "match_plate", "choose_frames", "default_mode"):
+                entry[key] = defaults[key]
+            self.select_item()
+
+        def change_values(self, *args):
+            if self.loading:
+                return
+            level = self.current_level()
+            item = self.lists[level].currentItem()
+            if item is None:
+                return
+            entry = self.entries[item.data(qt.UserRole)]
+            entry["label"] = self.label.text()
+            item.setText(entry["label"])
+            if level == "formats":
+                entry.update(
+                    channels=self.channels.currentText(), datatype=self.datatype.currentText(),
+                    compression=self.compression.currentText(), codec=self.codec.currentText(),
+                    output_transform=self.output.text(), match_plate=self.match_plate.isChecked(),
+                    choose_frames=self.choose_frames.isChecked(), default_mode=self.default_mode.currentText(),
+                )
+                self.update_controls()
+            elif level == "modes":
+                entry["kind"] = self.kind.currentText()
+            else:
+                entry["suffix"] = self.suffix.text()
+
+        def add_item(self):
+            level = self.current_level()
+            listing = self.lists[level]
+            if level == "formats":
+                entry = _format_preset("exr", "New EXR")
+            elif level == "modes":
+                entry = {"id": uuid.uuid4().hex, "label": "New mode", "kind": "sequence", "enabled": True}
+            else:
+                entry = {"id": uuid.uuid4().hex, "label": "New suffix", "suffix": "newOutput", "enabled": True}
+            existing = {self.entries[listing.item(i).data(qt.UserRole)]["label"].casefold() for i in range(listing.count())}
+            label = entry["label"]
+            number = 2
+            while entry["label"].casefold() in existing:
+                entry["label"] = f"{label} {number}"
+                number += 1
+            if level == "names":
+                suffixes = {value.get("suffix") for value in self.entries.values()}
+                while entry["suffix"] in suffixes:
+                    entry["suffix"] += "_new"
+            item = self.append_item(level, entry)
+            listing.setCurrentItem(item)
+            self.label.setFocus()
+            self.label.selectAll()
+
+        def remove_item(self):
+            listing = self.lists[self.current_level()]
+            if listing.count() <= 1:
+                return
+            item = listing.currentItem()
+            if item is not None:
+                self.entries.pop(item.data(qt.UserRole))
+                listing.takeItem(listing.row(item))
+                self.select_item()
+
+        def save(self):
+            settings = {"version": 2}
+            for level, listing in self.lists.items():
+                settings[level] = []
+                for index in range(listing.count()):
+                    item = listing.item(index)
+                    entry = dict(self.entries[item.data(qt.UserRole)])
+                    entry["enabled"] = item.checkState() == qt.Checked
+                    settings[level].append(entry)
+            try:
+                _save_settings(settings)
+            except (OSError, ValueError) as error:
+                widgets.QMessageBox.warning(self, "Shot Write", str(error))
+                return
+            self.accept()
+
+    return ActionRingEditor
+
+
+def edit_action_ring(initial_level="formats"):
+    core, gui, widgets = _qt_modules()
+    dialog = _editor_widget(core, gui, widgets)(widgets.QApplication.activeWindow(), initial_level)
+    result = dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()
+    dialog.deleteLater()
+    return result == widgets.QDialog.Accepted
 
 
 def edit_naming_suffixes():
-    _, _, widgets = _qt_modules()
-    dialog = widgets.QDialog(widgets.QApplication.activeWindow())
-    dialog.setWindowTitle("Shot Write — Naming Suffixes")
-    dialog.setMinimumWidth(390)
-    layout = widgets.QVBoxLayout(dialog)
-    scroll = widgets.QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setMinimumHeight(220)
-    content = widgets.QWidget()
-    rows = widgets.QVBoxLayout(content)
-    rows.addStretch()
-    scroll.setWidget(content)
-    layout.addWidget(scroll)
-    entries = []
-
-    def remove_entry(entry):
-        entries.remove(entry)
-        row, _, _ = entry
-        rows.removeWidget(row)
-        row.setParent(None)
-        row.deleteLater()
-        for _, _, button in entries:
-            button.setEnabled(len(entries) > 1)
-
-    def add_entry(name=""):
-        row = widgets.QWidget()
-        row_layout = widgets.QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        field = widgets.QLineEdit(name)
-        field.setAccessibleName("Naming suffix")
-        remove = widgets.QPushButton("Remove")
-        entry = (row, field, remove)
-        remove.clicked.connect(lambda: remove_entry(entry))
-        row_layout.addWidget(field)
-        row_layout.addWidget(remove)
-        entries.append(entry)
-        rows.insertWidget(rows.count() - 1, row)
-        for _, _, button in entries:
-            button.setEnabled(len(entries) > 1)
-        field.setFocus()
-        scroll.ensureWidgetVisible(row)
-
-    for name in _load_naming_options():
-        add_entry(name)
-    add = widgets.QPushButton("Add Suffix")
-    add.clicked.connect(lambda: add_entry())
-    layout.addWidget(add)
-    hint = widgets.QLabel("End a suffix with _00x for automatic numbering, e.g. preRender_00x.")
-    hint.setWordWrap(True)
-    layout.addWidget(hint)
-    buttons = widgets.QDialogButtonBox(
-        widgets.QDialogButtonBox.Save | widgets.QDialogButtonBox.Cancel | widgets.QDialogButtonBox.RestoreDefaults
-    )
-
-    def save():
-        try:
-            _save_naming_options([field.text() for _, field, _ in entries])
-        except (OSError, ValueError) as error:
-            widgets.QMessageBox.warning(dialog, "Shot Write", str(error))
-            return
-        dialog.accept()
-
-    def defaults():
-        for entry in list(entries):
-            remove_entry(entry)
-        for name in _NAMING_OPTIONS:
-            add_entry(name)
-
-    buttons.accepted.connect(save)
-    buttons.rejected.connect(dialog.reject)
-    buttons.button(widgets.QDialogButtonBox.RestoreDefaults).clicked.connect(defaults)
-    layout.addWidget(buttons)
-    if hasattr(dialog, "exec"):
-        dialog.exec()
-    else:
-        dialog.exec_()
-    dialog.deleteLater()
+    return edit_action_ring("names")
 
 
 def _numbered_prefix(naming):
@@ -354,14 +687,17 @@ def _match_plate(root, node):
     return colorspace
 
 
-def _configure_output(root, node, frame):
+def _configure_output(root, node, frame, preset=None):
+    if preset is None:
+        saved = node.knob("shot_write_preset")
+        preset = json.loads(saved.value()) if saved is not None else _format_preset(node["file_type"].value())
     node["raw"].setValue(False)
     node["use_limit"].setValue(False)
     file_type = node["file_type"].value()
     colorspace = None
-    if file_type in {"exr", "dpx"}:
+    if file_type in {"exr", "dpx"} and preset["match_plate"]:
         colorspace = _match_plate(root, node)
-    colorspace = colorspace or _output_colorspace(root, node)
+    colorspace = preset["output_transform"] or colorspace or _output_colorspace(root, node)
     if colorspace == "default":
         node["colorspace"].fromScript("default")
     else:
@@ -591,15 +927,15 @@ def _next_still_slot(file_type, naming, slot, frame, shot_dir, used_paths):
     return max(numbers, default=0) + 1
 
 
-def _set_mov_codec(node):
+def _set_mov_codec(node, codec="h264"):
     container = node.knob("mov64_format")
     if container is not None:
         container.setValue("mov (QuickTime / MOV)")
-    node["mov64_codec"].setValue("h264")
+    node["mov64_codec"].setValue(codec)
     node["mov64_quality"].setValue("High")
 
 
-def _create(file_type, frame=None, naming="toRunAI"):
+def _create(file_type, frame=None, naming="toRunAI", preset=None):
     root = nuke.root()
     script_path = root.name()
     if not os.path.isabs(script_path) or not os.path.isfile(script_path):
@@ -617,11 +953,13 @@ def _create(file_type, frame=None, naming="toRunAI"):
 
     node = None
     try:
+        save_preset = preset is not None
         script_dir = Path(script_path).parent
         shot_dir = script_dir.parent if script_dir.name.casefold() == "nuke" else script_dir
         multiview = len(nuke.views()) > 1
         used_paths = {node["file"].getText() for node in nuke.allNodes("Write", root, True)}
-        node_name, channels, datatype = _PROFILES[file_type]
+        preset = preset or _format_preset(file_type)
+        node_name = _PROFILES[file_type][0]
         slot = _next_slot(file_type, naming, frame, shot_dir, used_paths)
         still_slot = 1 if frame is None else _next_still_slot(file_type, naming, slot, frame, shot_dir, used_paths)
         pattern = _file_pattern(file_type, slot, multiview, frame, naming, still_slot)
@@ -629,16 +967,21 @@ def _create(file_type, frame=None, naming="toRunAI"):
         node.setName(node_name)
         node["file"].setValue(pattern)
         node["file_type"].setValue(file_type)
-        node["channels"].setValue(channels)
-        if datatype is not None:
-            node["datatype"].setValue(datatype)
+        node["channels"].setValue(preset["channels"])
+        if preset["datatype"]:
+            node["datatype"].setValue(preset["datatype"])
         node["create_directories"].setValue(True)
         if file_type == "exr":
             node["write_ACES_compliant_EXR"].setValue(False)
-            node["compression"].setValue("Zip (1 scanline)")
+            node["compression"].setValue(preset["compression"])
         elif file_type == "mov":
-            _set_mov_codec(node)
-        _configure_output(root, node, frame)
+            _set_mov_codec(node, preset["codec"])
+        _configure_output(root, node, frame, preset)
+        if save_preset:
+            saved = nuke.String_Knob("shot_write_preset", "")
+            saved.setVisible(False)
+            saved.setValue(json.dumps(preset))
+            node.addKnob(saved)
 
         if source is not None and not node.setInput(0, source):
             raise RuntimeError("The selected node cannot feed an image Write.")
@@ -680,27 +1023,33 @@ def _update_selected_writes():
 
 def _open_ring(file_type=None):
     group = nuke.lastHitGroup()
-    QtCore, QtGui, QtWidgets = _qt_modules()
-    frame = int(nuke.frame())
-    popup = _ring_widget(QtCore, QtGui, QtWidgets)(QtWidgets.QApplication.activeWindow(), frame, file_type)
-    position = QtGui.QCursor.pos()
-    screen = QtWidgets.QApplication.screenAt(position) or QtWidgets.QApplication.primaryScreen()
-    bounds = screen.availableGeometry()
-    half = popup.width() // 2
-    popup.move(
-        max(bounds.left(), min(position.x() - half, bounds.right() - popup.width() + 1)),
-        max(bounds.top(), min(position.y() - half, bounds.bottom() - popup.height() + 1)),
-    )
-    if hasattr(popup, "exec"):
-        popup.exec()
-    else:
-        popup.exec_()
-    selected = popup.selected
-    popup.deleteLater()
-
-    if selected is not None:
-        with group:
-            return _create(*selected)
+    core, gui, widgets = _qt_modules()
+    while True:
+        settings = _load_settings()
+        if file_type and not any(item["enabled"] and item["file_type"] == file_type for item in settings["formats"]):
+            nuke.message(f"Enable a {file_type.upper()} preset in Edit Action Ring.")
+            return
+        frame = int(nuke.frame())
+        popup = _ring_widget(core, gui, widgets)(widgets.QApplication.activeWindow(), frame, file_type)
+        position = gui.QCursor.pos()
+        screen = widgets.QApplication.screenAt(position) or widgets.QApplication.primaryScreen()
+        bounds = screen.availableGeometry()
+        half = popup.width() // 2
+        popup.move(
+            max(bounds.left(), min(position.x() - half, bounds.right() - popup.width() + 1)),
+            max(bounds.top(), min(position.y() - half, bounds.bottom() - popup.height() + 1)),
+        )
+        if popup.selected is None:
+            popup.exec() if hasattr(popup, "exec") else popup.exec_()
+        selected, edit_requested = popup.selected, popup.edit_requested
+        popup.deleteLater()
+        if edit_requested:
+            edit_action_ring()
+            continue
+        if selected is not None:
+            with group:
+                return _create(*selected)
+        return
 
 
 def _ring_widget(core, gui, widgets):
@@ -711,7 +1060,7 @@ def _ring_widget(core, gui, widgets):
         SIZE = 328
         INNER = 66
         OUTER = 159
-        NAMES_PER_PAGE = 5
+        ITEMS_PER_PAGE = 6
 
         def __init__(self, parent, frame, file_type=None):
             super().__init__(parent, qt.Popup | qt.FramelessWindowHint)
@@ -720,57 +1069,77 @@ def _ring_widget(core, gui, widgets):
             self.setMouseTracking(True)
             self.setAccessibleName("Shot Write Action Ring")
             self.selected = None
-            self.naming_options = _load_naming_options()
+            self.edit_requested = False
+            self.settings = _load_settings()
+            self.active = {
+                level: [item for item in self.settings[level] if item["enabled"]]
+                for level in ("formats", "modes", "names")
+            }
+            self.naming_options = tuple(item["suffix"] for item in self.active["names"])
             self.frame = frame
-            self.file_type = file_type
+            self.preset = next((item for item in self.active["formats"] if item["file_type"] == file_type), None)
+            self.file_type = self.preset["file_type"] if self.preset else None
             self.render_frame = None
-            center = self.SIZE / 2
+            self.history = []
+            center = self.SIZE // 2
             self.center = core.QPointF(center, center)
             self.previous_page = widgets.QPushButton("‹", self)
-            self.previous_page.setAccessibleName("Previous suffix page")
-            self.previous_page.setGeometry(int(center) - 49, int(center) + 28, 25, 23)
+            self.previous_page.setAccessibleName("Previous ring page")
+            self.previous_page.setGeometry(center - 49, center + 28, 25, 23)
             self.previous_page.clicked.connect(lambda: self.change_page(-1))
             self.next_page = widgets.QPushButton("›", self)
-            self.next_page.setAccessibleName("Next suffix page")
-            self.next_page.setGeometry(int(center) + 24, int(center) + 28, 25, 23)
+            self.next_page.setAccessibleName("Next ring page")
+            self.next_page.setGeometry(center + 24, center + 28, 25, 23)
             self.next_page.clicked.connect(lambda: self.change_page(1))
-            self.set_level("formats" if file_type is None else self.format_level())
+            self.settings_button = widgets.QPushButton("⚙", self)
+            self.settings_button.setAccessibleName("Edit Action Ring")
+            self.settings_button.setToolTip("Edit Action Ring")
+            self.settings_button.setGeometry(center - 13, center - 50, 26, 23)
+            self.settings_button.clicked.connect(self.request_editor)
+            if self.preset and not self.preset["choose_frames"]:
+                self.render_frame = frame if self.preset["default_mode"] == "frame" else None
+            self.set_level("formats" if self.preset is None else self.format_level())
 
         def format_level(self):
-            return "names" if self.file_type == "mov" else "frames"
+            return "frames" if self.preset["choose_frames"] else "names"
 
         def set_level(self, level):
             self.page = 0
             self.level = level
+            self.items = self.active["modes" if level == "frames" else level]
             self.update_sectors()
+            if len(self.items) == 1:
+                self.choose(0)
 
         def change_page(self, step):
-            if self.level == "names":
-                self.page = max(0, min(self.page + step, self.page_count - 1))
-                self.update_sectors()
+            self.page = max(0, min(self.page + step, self.page_count - 1))
+            self.update_sectors()
 
         def update_sectors(self):
-            level = self.level
             self.hovered = None
-            self.page_count = math.ceil(len(self.naming_options) / self.NAMES_PER_PAGE)
-            paged = level == "names" and self.page_count > 1
-            self.previous_page.setVisible(paged)
-            self.next_page.setVisible(paged)
+            self.page_count = math.ceil(len(self.items) / self.ITEMS_PER_PAGE)
+            self.previous_page.setVisible(self.page_count > 1)
+            self.next_page.setVisible(self.page_count > 1)
             self.previous_page.setEnabled(self.page > 0)
             self.next_page.setEnabled(self.page + 1 < self.page_count)
-            if level == "formats":
-                self.labels = (("PNG", "Reference"), ("EXR", "Precomp"), ("DPX", "Precomp"), ("MOV", "H.264"))
-                angles, half_angle = (90, 0, -90, 180), 43
-            elif level == "frames":
-                self.labels = (("1 Frame", f"Frame {self.frame}"), ("Sequence", "Frame range"))
-                angles, half_angle = (180, 0), 88
+            start = self.page * self.ITEMS_PER_PAGE
+            visible = self.items[start:start + self.ITEMS_PER_PAGE]
+            self.labels = []
+            for item in visible:
+                if self.level == "formats":
+                    subtitle = item["codec"].upper() if item["file_type"] == "mov" else item["file_type"].upper()
+                elif self.level == "frames":
+                    subtitle = f"Frame {self.frame}" if item["kind"] == "frame" else "Frame range"
+                else:
+                    subtitle = "Next number" if _numbered_prefix(item["suffix"]) is not None else ""
+                self.labels.append((item["label"], subtitle))
+            if self.level == "formats" and len(visible) == 4:
+                angles = (90, 0, -90, 180)
+            elif self.level == "frames" and len(visible) == 2:
+                angles = (180, 0)
             else:
-                start = self.page * self.NAMES_PER_PAGE
-                names = self.naming_options[start:start + self.NAMES_PER_PAGE]
-                self.labels = tuple((name, "Next number" if _numbered_prefix(name) is not None else "") for name in names)
-                angles = tuple(90 - index * 360 / len(names) for index in range(len(names)))
-                half_angle = 180 / len(names) - 2
-
+                angles = tuple(90 - index * 360 / len(visible) for index in range(len(visible)))
+            half_angle = 180 / len(visible) - 2
             self.offsets = [(112 * math.cos(math.radians(a)), -112 * math.sin(math.radians(a))) for a in angles]
             self.sectors = []
             for angle in angles:
@@ -796,6 +1165,7 @@ def _ring_widget(core, gui, widgets):
             hovered = self.sector_at(event)
             if self.hovered != hovered:
                 self.hovered = hovered
+                self.setToolTip(self.labels[hovered][0] if hovered is not None else "")
                 self.update()
 
         def leaveEvent(self, event):
@@ -815,18 +1185,20 @@ def _ring_widget(core, gui, widgets):
         def keyPressEvent(self, event):
             if event.isAutoRepeat():
                 return
-            if self.level == "names" and event.key() in (qt.Key_PageUp, qt.Key_PageDown):
+            if event.key() in (qt.Key_PageUp, qt.Key_PageDown):
                 self.change_page(1 if event.key() == qt.Key_PageDown else -1)
                 return
-            if self.level == "formats":
+            if self.level == "formats" and len(self.labels) == 4:
                 keys = (qt.Key_Up, qt.Key_Right, qt.Key_Down, qt.Key_Left)
-            elif self.level == "frames":
+            elif self.level == "frames" and len(self.labels) == 2:
                 keys = (qt.Key_Left, qt.Key_Right)
             else:
                 keys = ()
-            numbers = (qt.Key_1, qt.Key_2, qt.Key_3, qt.Key_4, qt.Key_5)[:len(self.labels)]
-            if event.key() == qt.Key_Escape and self.level != "formats":
-                self.set_level("frames" if self.level == "names" and self.format_level() == "frames" else "formats")
+            numbers = (qt.Key_1, qt.Key_2, qt.Key_3, qt.Key_4, qt.Key_5, qt.Key_6)[:len(self.labels)]
+            if event.key() == qt.Key_Escape and self.history:
+                level, self.preset, self.render_frame = self.history.pop()
+                self.file_type = self.preset["file_type"] if self.preset else None
+                self.set_level(level)
             elif event.key() in numbers:
                 self.choose(numbers.index(event.key()))
             elif event.key() in keys:
@@ -840,8 +1212,12 @@ def _ring_widget(core, gui, widgets):
             self.selected = None
             super().reject()
 
+        def request_editor(self):
+            self.edit_requested = True
+            self.reject()
+
         def wheelEvent(self, event):
-            if self.level == "names" and event.angleDelta().y():
+            if event.angleDelta().y():
                 self.change_page(1 if event.angleDelta().y() < 0 else -1)
                 event.accept()
             else:
@@ -850,16 +1226,20 @@ def _ring_widget(core, gui, widgets):
         def choose(self, index):
             if index is None:
                 self.reject()
-            elif self.level == "formats":
-                self.file_type = _COMMANDS[index][1]
-                self.render_frame = None
+                return
+            item = self.items[self.page * self.ITEMS_PER_PAGE + index]
+            if self.level != "names" and len(self.items) > 1:
+                self.history.append((self.level, self.preset, self.render_frame))
+            if self.level == "formats":
+                self.preset = item
+                self.file_type = item["file_type"]
+                self.render_frame = self.frame if item["default_mode"] == "frame" else None
                 self.set_level(self.format_level())
             elif self.level == "frames":
-                self.render_frame = self.frame if index == 0 else None
+                self.render_frame = self.frame if item["kind"] == "frame" else None
                 self.set_level("names")
             else:
-                name_index = self.page * self.NAMES_PER_PAGE + index
-                self.selected = (self.file_type, self.render_frame, self.naming_options[name_index])
+                self.selected = (self.file_type, self.render_frame, item["suffix"], self.preset)
                 self.accept()
 
         def paintEvent(self, event):
@@ -868,29 +1248,25 @@ def _ring_widget(core, gui, widgets):
             painter.setPen(gui.QColor("#465261"))
             painter.setBrush(gui.QColor("#171b21"))
             painter.drawEllipse(self.circle(self.OUTER + 3))
-
-            for i, (path, (title, subtitle), (dx, dy)) in enumerate(zip(self.sectors, self.labels, self.offsets)):
+            for index, (path, (title, subtitle), (dx, dy)) in enumerate(zip(self.sectors, self.labels, self.offsets)):
                 painter.setPen(gui.QColor("#465261"))
-                painter.setBrush(gui.QColor("#344b61" if i == self.hovered else "#252c35"))
+                painter.setBrush(gui.QColor("#344b61" if index == self.hovered else "#252c35"))
                 painter.drawPath(path)
-                if _numbered_prefix(title) is not None:
-                    dx -= 9
-                size = 13 if _numbered_prefix(title) is not None else 14
-                self.draw_centered(painter, dx, dy - 8 if subtitle else dy, title, size, "#f4f6f8", True)
+                if dx > 70:
+                    dx -= 10
+                elif dx < -70:
+                    dx += 10
+                self.draw_centered(painter, dx, dy - 8 if subtitle else dy, title, 13, "#f4f6f8", True)
                 if subtitle:
                     self.draw_centered(painter, dx, dy + 11, subtitle, 11, "#b6c4d1")
 
-            title = {"formats": "SHOT WRITE", "frames": self.file_type or "", "names": "OUTPUT NAME"}[self.level]
+            title = {"formats": "SHOT WRITE", "frames": self.preset["label"] if self.preset else "", "names": "OUTPUT NAME"}[self.level]
             self.draw_centered(painter, 0, -8 if self.level == "names" else 0, title.upper(), 13, "#f4f6f8", True)
             if self.level == "names":
-                if self.file_type == "mov":
-                    detail = "MOV · H.264"
-                else:
-                    mode = "Sequence" if self.render_frame is None else f"Frame {self.render_frame}"
-                    detail = f"{self.file_type.upper()} · {mode}"
-                self.draw_centered(painter, 0, 11, detail, 11, "#b6c4d1")
-                if self.page_count > 1:
-                    self.draw_centered(painter, 0, 39, f"{self.page + 1}/{self.page_count}", 11, "#b6c4d1")
+                mode = "Sequence" if self.render_frame is None else f"Frame {self.render_frame}"
+                self.draw_centered(painter, 0, 11, f"{self.file_type.upper()} · {mode}", 11, "#b6c4d1")
+            if self.page_count > 1:
+                self.draw_centered(painter, 0, 39, f"{self.page + 1}/{self.page_count}", 11, "#b6c4d1")
 
         def draw_centered(self, painter, x, y, text, size, color, bold=False):
             font = painter.font()
@@ -917,7 +1293,7 @@ def register_menu(replace=False):
     for label, file_type, shortcut in _COMMANDS:
         menu.addCommand(label, partial(_open_ring, file_type), shortcut, icon="Write.png", shortcutContext=2)
     menu.addSeparator()
-    menu.addCommand("Edit Naming Suffixes", edit_naming_suffixes, icon="Write.png", shortcutContext=2)
+    menu.addCommand("Edit Action Ring", edit_action_ring, icon="Write.png", shortcutContext=2)
     menu.addCommand("Paste Render as Read", paste_render_as_read, "Ctrl+Alt+R", icon="Read.png", shortcutContext=2)
     menu.addCommand("Update Selected Writes", _update_selected_writes, icon="Write.png", shortcutContext=2)
 

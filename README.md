@@ -29,9 +29,13 @@ Lưu script `.nk`, chọn node ảnh nguồn và bấm **Shift+Alt+W** trong Nod
 - `preRender_00x` tự lấy số tiếp theo từ các Write và thư mục output của shot.
 - Với 1 Frame, dùng nút **Render Frame** trong tab **Shot Write** của node để render frame đã chọn.
 
-Chọn **Shot Write → Edit Naming Suffixes** trong menu Nodes để sửa danh sách hậu tố. Dùng **Add Suffix** để thêm hoặc **Remove** để xóa, giữ ít nhất một mục. Bấm **Save** để áp dụng cho lần mở vòng tiếp theo. **Restore Defaults** điền lại năm tên mặc định để bạn lưu. Cấu hình cá nhân nằm tại `.nuke/shot_write_settings.json`.
+Chọn **Shot Write → Edit Action Ring** trong menu Nodes hoặc bấm bánh răng ở tâm vòng để chỉnh cấu hình. Cửa sổ có ba cấp **Formats**, **Render modes** và **Naming suffixes**. Mỗi cấp cho thêm, xóa, bật/tắt, đổi tên hiển thị và kéo để sắp xếp. Giữ ít nhất một mục đang bật ở mỗi cấp. **Save** áp dụng cho lần mở vòng tiếp theo, **Restore Defaults** điền lại cấu hình mặc định để bạn lưu. Cấu hình cá nhân nằm tại `.nuke/shot_write_settings.json`. Danh sách hậu tố đã lưu từ phiên bản cũ được nạp tự động.
 
-Vòng chọn hiển thị tối đa năm hậu tố mỗi trang. Với danh sách dài hơn, dùng nút ‹ / › ở giữa vòng, cuộn chuột hoặc Page Up / Page Down để đổi trang. Các phím 1–5 chọn mục trên trang hiện tại.
+Mỗi preset định dạng có loại file PNG, EXR, DPX hoặc MOV, channels, datatype, compression EXR, codec MOV và output transform. Có thể thêm nhiều preset cho cùng một loại file. Để **Output transform** trống để tự chọn màu. **Match Read_Plate** lấy datatype, compression EXR và màu theo plate. Khi cần dùng datatype và compression tự đặt, tắt mục này. Output transform nhập trực tiếp được ưu tiên.
+
+**Ask for render mode** quyết định preset có hiện bước chọn 1 Frame / Sequence. Khi bỏ chọn, preset dùng **Default mode**. Các mục trong cấp **Render modes** có tên hiển thị riêng và hành vi `frame` hoặc `sequence`. Tên hiển thị của hậu tố cũng có thể khác **Filename suffix** thực tế.
+
+Vòng chọn hiển thị tối đa sáu mục mỗi trang ở cả ba cấp. Với danh sách dài hơn, dùng nút ‹ / › ở giữa vòng, cuộn chuột hoặc Page Up / Page Down để đổi trang. Các phím 1–6 chọn mục trên trang hiện tại. Cấp chỉ có một mục đang bật được chọn tự động.
 
 Có thể dùng hậu tố kết thúc bằng `_00x` để tự tăng số. Ví dụ, `review_00x` tạo `review_001`, `review_002`… Các hậu tố hỗ trợ chữ, số, dấu gạch dưới và dấu gạch nối.
 
